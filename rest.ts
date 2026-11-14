@@ -279,7 +279,7 @@ function lineDiff(oldText: string, newText: string): { additions: number; deleti
   return { additions: newLines.length - lcs, deletions: oldLines.length - lcs };
 }
 
-function computePullFiles(repo: Repo, baseTreeOid: string, headTreeOid: string): PullFile[] {
+export function computePullFiles(repo: Repo, baseTreeOid: string, headTreeOid: string): PullFile[] {
   const base = flattenTree(repo, baseTreeOid);
   const head = flattenTree(repo, headTreeOid);
   const files: PullFile[] = [];
@@ -378,6 +378,74 @@ function paginate<T>(items: readonly T[], query: URLSearchParams): T[] {
   const perPage = Math.min(100, Math.max(1, Number.parseInt(query.get('per_page') ?? '30', 10) || 30));
   const page = Math.max(1, Number.parseInt(query.get('page') ?? '1', 10) || 1);
   return items.slice((page - 1) * perPage, page * perPage);
+}
+
+/**
+ * Squash-merge a pull request onto its base branch — the one merge the
+ * suite ever asks for, shared by REST, GraphQL and MCP so all three
+ * surfaces agree on the outcome. Returns the merge commit sha, or an
+ * error reason: 'closed' (already merged/closed), 'missing' (a ref is
+ * gone) or 'conflict' (three-way: a file changed on base since the PR was
+ * created AND changed differently on head).
+ */
+export function squashMergePull(
+  repo: Repo,
+  pull: PullRequest,
+): { ok: true; sha: string } | { ok: false; reason: 'closed' | 'missing' | 'conflict' } {
+  if (pull.state === 'closed') return { ok: false, reason: 'closed' };
+  const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
+  const headTip = repo.refs.get(`refs/heads/${pull.headRef}`);
+  if (baseTip === undefined || headTip === undefined) return { ok: false, reason: 'missing' };
+  const baseAtCreation = flattenTree(repo, parseCommit(repo.objects.get(pull.baseSha)!.data).tree);
+  const baseNow = flattenTree(repo, parseCommit(repo.objects.get(baseTip)!.data).tree);
+  const headNow = flattenTree(repo, parseCommit(repo.objects.get(headTip)!.data).tree);
+  for (const file of pull.files) {
+    const created = baseAtCreation.get(file.filename)?.oid;
+    const now = baseNow.get(file.filename)?.oid;
+    const head = headNow.get(file.filename)?.oid;
+    if (now !== created && head !== now) return { ok: false, reason: 'conflict' };
+  }
+  const baseTree = parseCommit(repo.objects.get(baseTip)!.data).tree;
+  let newTree = baseTree;
+  for (const file of pull.files) {
+    const headEntry = headNow.get(file.filename);
+    const segments = file.filename.split('/').filter((part) => part !== '');
+    newTree = setPathInTree(repo, newTree, segments, headEntry?.oid ?? null);
+  }
+  const mergeCommit = buildCommit({
+    tree: newTree,
+    parents: [baseTip],
+    message: `${pull.title} (#${pull.number})`,
+    author: FORGE_IDENTITY,
+    committer: FORGE_IDENTITY,
+    timestamp: FORGE_EPOCH_SEC,
+  });
+  const mergeSha = hashObject('commit', mergeCommit);
+  repo.objects.set(mergeSha, { type: 'commit', data: mergeCommit });
+  repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+  pull.state = 'closed';
+  pull.merged = true;
+  pull.mergeCommitSha = mergeSha;
+  pull.mergedAt = FIXED_ISO;
+  return { ok: true, sha: mergeSha };
+}
+
+/** The mergeability a GraphQL `mergeable` field reports for a PR. */
+export function pullMergeable(repo: Repo, pull: PullRequest): 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN' {
+  if (pull.state === 'closed') return 'UNKNOWN';
+  const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
+  const headTip = repo.refs.get(`refs/heads/${pull.headRef}`);
+  if (baseTip === undefined || headTip === undefined) return 'UNKNOWN';
+  const baseAtCreation = flattenTree(repo, parseCommit(repo.objects.get(pull.baseSha)!.data).tree);
+  const baseNow = flattenTree(repo, parseCommit(repo.objects.get(baseTip)!.data).tree);
+  const headNow = flattenTree(repo, parseCommit(repo.objects.get(headTip)!.data).tree);
+  for (const file of pull.files) {
+    const created = baseAtCreation.get(file.filename)?.oid;
+    const now = baseNow.get(file.filename)?.oid;
+    const head = headNow.get(file.filename)?.oid;
+    if (now !== created && head !== now) return 'CONFLICTING';
+  }
+  return 'MERGEABLE';
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -763,49 +831,13 @@ export function handleRest(
       }
       if (rest[2] === 'merge' && rest.length === 3) {
         if (method !== 'PUT') return err(404, 'Not Found');
-        if (pull.state === 'closed') return err(405, 'Pull request is already closed');
-        const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
-        const headTip = repo.refs.get(`refs/heads/${pull.headRef}`);
-        if (baseTip === undefined || headTip === undefined) return err(404, 'Not Found');
-        // Conflict (three-way): a file changed on base since the PR was
-        // created AND changed differently on head is a 405, never a 409.
-        const baseAtCreation = flattenTree(repo, parseCommit(repo.objects.get(pull.baseSha)!.data).tree);
-        const baseNow = flattenTree(repo, parseCommit(repo.objects.get(baseTip)!.data).tree);
-        const headNow = flattenTree(repo, parseCommit(repo.objects.get(headTip)!.data).tree);
-        for (const file of pull.files) {
-          const created = baseAtCreation.get(file.filename)?.oid;
-          const now = baseNow.get(file.filename)?.oid;
-          const head = headNow.get(file.filename)?.oid;
-          const baseChanged = now !== created;
-          const headDiffersFromBaseNow = head !== now;
-          if (baseChanged && headDiffersFromBaseNow) {
-            return err(405, 'This pull request cannot be merged: merge conflict');
-          }
+        const result = squashMergePull(repo, pull);
+        if (!result.ok) {
+          if (result.reason === 'closed') return err(405, 'Pull request is already closed');
+          if (result.reason === 'missing') return err(404, 'Not Found');
+          return err(405, 'This pull request cannot be merged: merge conflict');
         }
-        // Squash: one commit on the base branch, applying the PR's files.
-        const baseTree = parseCommit(repo.objects.get(baseTip)!.data).tree;
-        let newTree = baseTree;
-        for (const file of pull.files) {
-          const headEntry = headNow.get(file.filename);
-          const segments = file.filename.split('/').filter((part) => part !== '');
-          newTree = setPathInTree(repo, newTree, segments, headEntry?.oid ?? null);
-        }
-        const mergeCommit = buildCommit({
-          tree: newTree,
-          parents: [baseTip],
-          message: `${pull.title} (#${pull.number})`,
-          author: FORGE_IDENTITY,
-          committer: FORGE_IDENTITY,
-          timestamp: FORGE_EPOCH_SEC,
-        });
-        const mergeSha = hashObject('commit', mergeCommit);
-        repo.objects.set(mergeSha, { type: 'commit', data: mergeCommit });
-        repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
-        pull.state = 'closed';
-        pull.merged = true;
-        pull.mergeCommitSha = mergeSha;
-        pull.mergedAt = FIXED_ISO;
-        return ok(200, { merged: true, sha: mergeSha, message: 'Pull request successfully merged' });
+        return ok(200, { merged: true, sha: result.sha, message: 'Pull request successfully merged' });
       }
       return err(404, 'Not Found');
     }
