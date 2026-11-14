@@ -1,17 +1,22 @@
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
-// port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
-// the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
+// port it bound, then poll until the env says the trial is over and exit 0. The suite scores the
+// server app.ts builds; this file is the harness's lifecycle, kept deliberately small — the one
+// addition beyond the kit starter is a self-check (below) that the bound server answers its own
+// /healthz before registering, so a silent bind failure ends the trial at once instead of wasting
+// the whole wall budget on an env dialing a dead port.
 //
 //   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
 //      there is nothing to talk to, so the program exits 1 at once.
 //   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
-//   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address the request came from
+//   3. Self-check: GET http://127.0.0.1:<port>/healthz (3 tries). A server that cannot answer its own
+//      health check is broken; exit 1 now rather than register a dead port.
+//   4. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address the request came from
 //      plus N as your base URL and dials it from then on. The first register wins; a 409 means another
 //      entry already registered, and this process keeps waiting like any other.
-//   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env answers at once ({"done":
+//   5. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env answers at once ({"done":
 //      false} while the suite runs), so this is a poll, not a long-held request. A failed or slow poll
 //      is retried with a short exponential backoff; the process never exits before the env says done.
-//   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
+//   6. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
 //      reads.
 //
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
@@ -76,6 +81,24 @@ async function waitForDone(): Promise<void> {
   }
 }
 
+/**
+ * Dial our own /healthz a few times before registering. listen(0) succeeding does not prove the
+ * socket answers: if it never does, the env would dial a dead port for the whole trial. Fail fast
+ * instead — a healthy server answers on loopback in milliseconds, so three misses means broken.
+ */
+async function selfCheck(port: number): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(5_000) });
+      if (res.ok) return;
+    } catch {
+      // Not answering yet: wait a beat and try again.
+    }
+    await sleep(500);
+  }
+  throw new Error(`the server does not answer its own /healthz on port ${port}`);
+}
+
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
   const server = createApp();
@@ -87,6 +110,7 @@ async function main(): Promise<void> {
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
   process.stdout.write(`[entry] listening on port ${address.port}\n`);
 
+  await selfCheck(address.port);
   await register(address.port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
