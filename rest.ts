@@ -26,9 +26,12 @@ import {
   VIEWER_ID,
   VIEWER_LOGIN,
   VIEWER_NAME,
+  Store,
   hashObject,
+  type Issue,
+  type PullFile,
+  type PullRequest,
   type Repo,
-  type Store,
 } from './store.ts';
 import {
   buildCommit,
@@ -238,6 +241,145 @@ function deleteContentsCommit(repo: Repo, refName: string, path: string, message
   return commitSha;
 }
 
+/* ------------------------------------------------------------ issues & pulls */
+
+/** Flatten a tree to path -> {oid, mode}, recursively. */
+function flattenTree(repo: Repo, rootTreeOid: string, prefix = ''): Map<string, { oid: string; mode: string }> {
+  const out = new Map<string, { oid: string; mode: string }>();
+  const walk = (treeOid: string, base: string): void => {
+    const treeObj = repo.objects.get(treeOid);
+    if (treeObj === undefined || treeObj.type !== 'tree') return;
+    for (const entry of parseTree(treeObj.data)) {
+      const path = base === '' ? entry.name : `${base}/${entry.name}`;
+      if (entry.mode === '40000') walk(entry.oid, path);
+      else if (entry.mode !== '160000') out.set(path, { oid: entry.oid, mode: entry.mode });
+    }
+  };
+  walk(rootTreeOid, prefix);
+  return out;
+}
+
+/** Line counts for a modified file: added/removed lines via LCS on lines. */
+function lineDiff(oldText: string, newText: string): { additions: number; deletions: number } {
+  const oldLines = oldText === '' ? [] : oldText.split('\n');
+  const newLines = newText === '' ? [] : newText.split('\n');
+  if (oldLines.length === 0) return { additions: newLines.length, deletions: 0 };
+  if (newLines.length === 0) return { additions: 0, deletions: oldLines.length };
+  // LCS lengths, two rows; files here are small (scenario blobs are ~2-4 KiB).
+  let prev = new Array<number>(newLines.length + 1).fill(0);
+  let curr = new Array<number>(newLines.length + 1).fill(0);
+  for (let i = 1; i <= oldLines.length; i += 1) {
+    for (let j = 1; j <= newLines.length; j += 1) {
+      curr[j] = oldLines[i - 1] === newLines[j - 1] ? prev[j - 1]! + 1 : Math.max(prev[j]!, curr[j - 1]!);
+    }
+    [prev, curr] = [curr, prev];
+    curr.fill(0);
+  }
+  const lcs = prev[newLines.length]!;
+  return { additions: newLines.length - lcs, deletions: oldLines.length - lcs };
+}
+
+function computePullFiles(repo: Repo, baseTreeOid: string, headTreeOid: string): PullFile[] {
+  const base = flattenTree(repo, baseTreeOid);
+  const head = flattenTree(repo, headTreeOid);
+  const files: PullFile[] = [];
+  const names = new Set([...base.keys(), ...head.keys()]);
+  for (const name of [...names].sort()) {
+    const b = base.get(name);
+    const h = head.get(name);
+    if (h !== undefined && b === undefined) {
+      const blob = repo.objects.get(h.oid);
+      const text = blob !== undefined ? blob.data.toString('utf8') : '';
+      const lines = text === '' ? 0 : text.split('\n').length;
+      files.push({ filename: name, status: 'added', additions: lines, deletions: 0 });
+    } else if (h === undefined && b !== undefined) {
+      const blob = repo.objects.get(b.oid);
+      const text = blob !== undefined ? blob.data.toString('utf8') : '';
+      const lines = text === '' ? 0 : text.split('\n').length;
+      files.push({ filename: name, status: 'removed', additions: 0, deletions: lines });
+    } else if (h !== undefined && b !== undefined && h.oid !== b.oid) {
+      const oldBlob = repo.objects.get(b.oid);
+      const newBlob = repo.objects.get(h.oid);
+      const { additions, deletions } = lineDiff(
+        oldBlob !== undefined ? oldBlob.data.toString('utf8') : '',
+        newBlob !== undefined ? newBlob.data.toString('utf8') : '',
+      );
+      files.push({ filename: name, status: 'modified', additions, deletions });
+    }
+  }
+  return files;
+}
+
+function labelJson(repo: Repo, name: string): Record<string, unknown> {
+  const label = repo.labels.get(name);
+  return { name, color: label?.color ?? 'ededed', description: '' };
+}
+
+function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
+  return {
+    id: issue.id,
+    node_id: Store.globalId('Issue', issue.id),
+    number: issue.number,
+    title: issue.title,
+    body: issue.body,
+    state: issue.state,
+    labels: issue.labels.map((name) => labelJson(repo, name)),
+    user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
+    assignee: null,
+    assignees: [],
+    locked: false,
+    comments: issue.comments.length,
+    created_at: FIXED_ISO,
+    updated_at: FIXED_ISO,
+    closed_at: issue.state === 'closed' ? FIXED_ISO : null,
+    html_url: `https://github.com/${repo.owner}/${repo.name}/issues/${issue.number}`,
+    url: `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
+  };
+}
+
+function pullJson(repo: Repo, pull: PullRequest): Record<string, unknown> {
+  return {
+    id: pull.id,
+    node_id: Store.globalId('PullRequest', pull.id),
+    number: pull.number,
+    title: pull.title,
+    body: pull.body,
+    state: pull.state,
+    locked: false,
+    merged: pull.merged,
+    mergeable: true,
+    merge_commit_sha: pull.mergeCommitSha,
+    merged_at: pull.mergedAt,
+    created_at: FIXED_ISO,
+    updated_at: FIXED_ISO,
+    closed_at: pull.state === 'closed' ? FIXED_ISO : null,
+    head: {
+      ref: pull.headRef,
+      sha: pull.headSha,
+      label: `${repo.owner}:${pull.headRef}`,
+      user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
+      repo: { name: repo.name, full_name: `${repo.owner}/${repo.name}` },
+    },
+    base: {
+      ref: pull.baseRef,
+      sha: pull.baseSha,
+      label: `${repo.owner}:${pull.baseRef}`,
+      user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
+      repo: { name: repo.name, full_name: `${repo.owner}/${repo.name}` },
+    },
+    user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
+    html_url: `https://github.com/${repo.owner}/${repo.name}/pull/${pull.number}`,
+    url: `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${pull.number}`,
+  };
+}
+
+/** Paginate a list the GitHub way: per_page (default 30) + page (default 1). */
+function paginate<T>(items: readonly T[], query: URLSearchParams): T[] {
+  const perPage = Math.min(100, Math.max(1, Number.parseInt(query.get('per_page') ?? '30', 10) || 30));
+  const page = Math.max(1, Number.parseInt(query.get('page') ?? '1', 10) || 1);
+  return items.slice((page - 1) * perPage, page * perPage);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -441,6 +583,229 @@ export function handleRest(
         }
         const commitSha = deleteContentsCommit(repo, refName, path, message);
         return ok(200, { commit: { sha: commitSha } });
+      }
+      return err(404, 'Not Found');
+    }
+
+    if (rest[0] === 'labels') {
+      if (method === 'GET' && rest.length === 1) {
+        return ok(200, [...repo.labels.keys()].map((name) => labelJson(repo, name)));
+      }
+      if (method === 'POST' && rest.length === 1) {
+        const input = bodyOf(body);
+        const name = typeof input.name === 'string' ? input.name.trim() : '';
+        if (name === '') return err(422, 'Invalid label name');
+        const color = typeof input.color === 'string' ? input.color : 'ededed';
+        repo.labels.set(name, { name, color });
+        return ok(201, labelJson(repo, name));
+      }
+      return err(404, 'Not Found');
+    }
+
+    if (rest[0] === 'issues') {
+      // POST /issues — create. Labels must already exist (422 otherwise).
+      if (method === 'POST' && rest.length === 1) {
+        const input = bodyOf(body);
+        const title = typeof input.title === 'string' ? input.title : '';
+        const bodyText = typeof input.body === 'string' ? input.body : '';
+        const labelNames: string[] = Array.isArray(input.labels)
+          ? (input.labels as unknown[]).filter((l): l is string => typeof l === 'string')
+          : [];
+        for (const label of labelNames) {
+          if (!repo.labels.has(label)) return err(422, `Label does not exist: ${label}`);
+        }
+        const number = repo.nextIssueNumber++;
+        const issue: Issue = {
+          id: store.nextIssueIdFor(),
+          number,
+          title,
+          body: bodyText,
+          state: 'open',
+          labels: labelNames,
+          createdSeq: ++repo.seq,
+          comments: [],
+        };
+        repo.issues.set(number, issue);
+        return ok(201, issueJson(repo, issue));
+      }
+      // GET /issues — list, state filter (default open), created sort.
+      if (method === 'GET' && rest.length === 1) {
+        const state = query.get('state') ?? 'open';
+        const sort = query.get('sort') ?? 'created';
+        const direction = query.get('direction') ?? 'desc';
+        let items = [...repo.issues.values()];
+        if (state !== 'all') items = items.filter((issue) => issue.state === state);
+        if (sort === 'created') {
+          items.sort((a, b) => (direction === 'asc' ? a.createdSeq - b.createdSeq : b.createdSeq - a.createdSeq));
+        }
+        return ok(200, paginate(items, query).map((issue) => issueJson(repo, issue)));
+      }
+      const number = Number.parseInt(rest[1] ?? '', 10);
+      if (!Number.isSafeInteger(number) || number < 1) return err(404, 'Not Found');
+      const issue = repo.issues.get(number);
+      if (issue === undefined) return err(404, 'Not Found');
+      if (rest.length === 2) {
+        if (method === 'GET') return ok(200, issueJson(repo, issue));
+        if (method === 'PATCH') {
+          const input = bodyOf(body);
+          if (typeof input.title === 'string') issue.title = input.title;
+          if (typeof input.body === 'string') issue.body = input.body;
+          if (input.state === 'open' || input.state === 'closed') issue.state = input.state;
+          if (Array.isArray(input.labels)) {
+            const labelNames = (input.labels as unknown[]).filter((l): l is string => typeof l === 'string');
+            for (const label of labelNames) {
+              if (!repo.labels.has(label)) return err(422, `Label does not exist: ${label}`);
+            }
+            issue.labels = labelNames;
+          }
+          return ok(200, issueJson(repo, issue));
+        }
+        return err(404, 'Not Found');
+      }
+      if (rest[1] !== undefined && rest[2] === 'comments') {
+        if (method === 'POST' && rest.length === 3) {
+          const input = bodyOf(body);
+          const commentBody = typeof input.body === 'string' ? input.body : '';
+          const comment = { id: repo.nextCommentId++, body: commentBody };
+          issue.comments.push(comment);
+          return ok(201, {
+            id: comment.id,
+            node_id: Store.globalId('IssueComment', comment.id),
+            body: comment.body,
+            user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
+            created_at: FIXED_ISO,
+            updated_at: FIXED_ISO,
+            html_url: `https://github.com/${repo.owner}/${repo.name}/issues/${number}#issuecomment-${comment.id}`,
+            url: `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/comments/${comment.id}`,
+          });
+        }
+        if (method === 'GET' && rest.length === 3) {
+          return ok(200, issue.comments.map((comment) => ({
+            id: comment.id,
+            node_id: Store.globalId('IssueComment', comment.id),
+            body: comment.body,
+            user: { login: VIEWER_LOGIN, id: VIEWER_ID, type: 'User' },
+            created_at: FIXED_ISO,
+            updated_at: FIXED_ISO,
+          })));
+        }
+        return err(404, 'Not Found');
+      }
+      return err(404, 'Not Found');
+    }
+
+    if (rest[0] === 'pulls') {
+      // POST /pulls — create from head/base branches.
+      if (method === 'POST' && rest.length === 1) {
+        const input = bodyOf(body);
+        const headRef = typeof input.head === 'string' ? input.head : '';
+        const baseRef = typeof input.base === 'string' ? input.base : repo.defaultBranch;
+        const title = typeof input.title === 'string' ? input.title : '';
+        const bodyText = typeof input.body === 'string' ? input.body : '';
+        const headSha = repo.refs.get(`refs/heads/${headRef}`);
+        const baseSha = repo.refs.get(`refs/heads/${baseRef}`);
+        if (headSha === undefined || baseSha === undefined) return err(422, 'Invalid head or base branch');
+        const headTip = repo.objects.get(headSha);
+        const baseTip = repo.objects.get(baseSha);
+        if (headTip === undefined || baseTip === undefined || headTip.type !== 'commit' || baseTip.type !== 'commit') {
+          return err(422, 'Invalid head or base branch');
+        }
+        const files = computePullFiles(repo, parseCommit(baseTip.data).tree, parseCommit(headTip.data).tree);
+        const number = repo.nextPullNumber++;
+        const pull: PullRequest = {
+          id: store.nextPullIdFor(),
+          number,
+          title,
+          body: bodyText,
+          state: 'open',
+          merged: false,
+          mergeCommitSha: null,
+          mergedAt: null,
+          headRef,
+          baseRef,
+          headSha,
+          baseSha,
+          createdSeq: ++repo.seq,
+          files,
+          headTreeSha: parseCommit(headTip.data).tree,
+        };
+        repo.pulls.set(number, pull);
+        return ok(201, pullJson(repo, pull));
+      }
+      // GET /pulls — list, state filter (default open).
+      if (method === 'GET' && rest.length === 1) {
+        const state = query.get('state') ?? 'open';
+        let items = [...repo.pulls.values()];
+        if (state !== 'all') items = items.filter((pull) => pull.state === state);
+        items.sort((a, b) => b.createdSeq - a.createdSeq);
+        return ok(200, paginate(items, query).map((pull) => pullJson(repo, pull)));
+      }
+      const number = Number.parseInt(rest[1] ?? '', 10);
+      if (!Number.isSafeInteger(number) || number < 1) return err(404, 'Not Found');
+      const pull = repo.pulls.get(number);
+      if (pull === undefined) return err(404, 'Not Found');
+      if (rest.length === 2) {
+        if (method === 'GET') return ok(200, pullJson(repo, pull));
+        return err(404, 'Not Found');
+      }
+      if (rest[2] === 'files' && rest.length === 3) {
+        if (method !== 'GET') return err(404, 'Not Found');
+        return ok(200, pull.files.map((file) => ({
+          filename: file.filename,
+          status: file.status,
+          additions: file.additions,
+          deletions: file.deletions,
+          changes: file.additions + file.deletions,
+          sha: '',
+          blob_url: '',
+          raw_url: '',
+        })));
+      }
+      if (rest[2] === 'merge' && rest.length === 3) {
+        if (method !== 'PUT') return err(404, 'Not Found');
+        if (pull.state === 'closed') return err(405, 'Pull request is already closed');
+        const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
+        const headTip = repo.refs.get(`refs/heads/${pull.headRef}`);
+        if (baseTip === undefined || headTip === undefined) return err(404, 'Not Found');
+        // Conflict (three-way): a file changed on base since the PR was
+        // created AND changed differently on head is a 405, never a 409.
+        const baseAtCreation = flattenTree(repo, parseCommit(repo.objects.get(pull.baseSha)!.data).tree);
+        const baseNow = flattenTree(repo, parseCommit(repo.objects.get(baseTip)!.data).tree);
+        const headNow = flattenTree(repo, parseCommit(repo.objects.get(headTip)!.data).tree);
+        for (const file of pull.files) {
+          const created = baseAtCreation.get(file.filename)?.oid;
+          const now = baseNow.get(file.filename)?.oid;
+          const head = headNow.get(file.filename)?.oid;
+          const baseChanged = now !== created;
+          const headDiffersFromBaseNow = head !== now;
+          if (baseChanged && headDiffersFromBaseNow) {
+            return err(405, 'This pull request cannot be merged: merge conflict');
+          }
+        }
+        // Squash: one commit on the base branch, applying the PR's files.
+        const baseTree = parseCommit(repo.objects.get(baseTip)!.data).tree;
+        let newTree = baseTree;
+        for (const file of pull.files) {
+          const headEntry = headNow.get(file.filename);
+          const segments = file.filename.split('/').filter((part) => part !== '');
+          newTree = setPathInTree(repo, newTree, segments, headEntry?.oid ?? null);
+        }
+        const mergeCommit = buildCommit({
+          tree: newTree,
+          parents: [baseTip],
+          message: `${pull.title} (#${pull.number})`,
+          author: FORGE_IDENTITY,
+          committer: FORGE_IDENTITY,
+          timestamp: FORGE_EPOCH_SEC,
+        });
+        const mergeSha = hashObject('commit', mergeCommit);
+        repo.objects.set(mergeSha, { type: 'commit', data: mergeCommit });
+        repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+        pull.state = 'closed';
+        pull.merged = true;
+        pull.mergeCommitSha = mergeSha;
+        pull.mergedAt = FIXED_ISO;
+        return ok(200, { merged: true, sha: mergeSha, message: 'Pull request successfully merged' });
       }
       return err(404, 'Not Found');
     }
