@@ -6,7 +6,8 @@
 //   /{owner}/{repo}.git/git-upload-pack   upload-pack v2 (+ v0 fallback)
 //   /{owner}/{repo}.git/git-receive-pack  receive-pack v0
 //   /api/v3/...                       REST v3 (rest.ts)
-//   /api/graphql, /mcp               Stage 4 — 404 JSON until then
+//   /api/graphql                      GraphQL (graphql.ts, Stage 4)
+//   /mcp                              MCP JSON-RPC 2.0 (mcp.ts, Stage 4)
 //
 // Auth: the suite presents `Authorization: Bearer $MAKEFUN_SHOP_TOKEN`.
 // When the env var is set, the token must match it exactly; when it is not
@@ -17,6 +18,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Store, VIEWER_LOGIN } from './store.ts';
 import { handleRest } from './rest.ts';
+import { handleGraphQL } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
 import {
   applyPush,
   lsRefs,
@@ -208,13 +211,24 @@ export function createApp(): Server {
         return;
       }
 
-      // ---- not yet built (Stage 4) ----
+      // ---- GraphQL + MCP ----
       if (path === '/api/graphql' || path === '/mcp') {
         if (!bearerOk(req)) {
           json(res, 401, { message: 'Requires authentication' });
           return;
         }
-        json(res, 404, { message: 'Not Found' });
+        // Both surfaces take the raw body: GraphQL needs it for batching,
+        // MCP needs it to answer a malformed body with HTTP 400 + -32700.
+        const raw = await readBody(req);
+        const bodyText = raw.toString('utf8');
+        const reply = path === '/api/graphql' ? handleGraphQL(store, bodyText) : handleMcp(store, method, bodyText);
+        if (reply.json === undefined) {
+          // Notification / session close: no body.
+          res.writeHead(reply.status, { 'x-github-request-id': `req-${++requestSeq}` });
+          res.end();
+          return;
+        }
+        json(res, reply.status, reply.json);
         return;
       }
 
